@@ -118,9 +118,33 @@ def fetch_forecast(latitude: float, longitude: float) -> dict[str, Any]:
             "forecast_days": 3,
             "temperature_unit": "celsius",
             "current": "temperature_2m,relative_humidity_2m",
+            "hourly": "temperature_2m,relative_humidity_2m",
             "daily": "temperature_2m_max,temperature_2m_min",
         },
     )
+
+
+def daily_max_heat_index(forecast: dict[str, Any]) -> dict[str, float]:
+    """Max heat index (°C) per local calendar day from hourly temp/humidity."""
+    hourly = forecast.get("hourly") or {}
+    times = hourly.get("time") or []
+    temps = hourly.get("temperature_2m") or []
+    humidities = hourly.get("relative_humidity_2m") or []
+    if not (times and temps and humidities) or not (
+        len(times) == len(temps) == len(humidities)
+    ):
+        return {}
+
+    maxima: dict[str, float] = {}
+    for timestamp, temp, humidity in zip(times, temps, humidities, strict=True):
+        if temp is None or humidity is None:
+            continue
+        day = timestamp[:10]
+        heat_index = heat_index_celsius(float(temp), float(humidity))
+        previous = maxima.get(day)
+        if previous is None or heat_index > previous:
+            maxima[day] = heat_index
+    return maxima
 
 
 def format_place(location: dict[str, Any]) -> str:
@@ -147,20 +171,32 @@ def build_report_data(
     temp_c = float(current["temperature_2m"])
     humidity = float(current["relative_humidity_2m"])
     heat_index = heat_index_celsius(temp_c, humidity)
-    days = [
-        {
-            "date_iso": day,
-            "date_label": format_date(day),
-            "high_c": float(high),
-            "low_c": float(low),
-        }
-        for day, high, low in zip(
-            daily["time"],
-            daily["temperature_2m_max"],
-            daily["temperature_2m_min"],
-            strict=True,
+    current_warning = heat_index > HEAT_INDEX_WARNING_C
+    max_heat_by_day = daily_max_heat_index(forecast)
+
+    days = []
+    for day, high, low in zip(
+        daily["time"],
+        daily["temperature_2m_max"],
+        daily["temperature_2m_min"],
+        strict=True,
+    ):
+        max_heat_index = max_heat_by_day.get(day)
+        day_warning = (
+            max_heat_index is not None and max_heat_index > HEAT_INDEX_WARNING_C
         )
-    ]
+        days.append(
+            {
+                "date_iso": day,
+                "date_label": format_date(day),
+                "high_c": float(high),
+                "low_c": float(low),
+                "heat_index_max_c": max_heat_index,
+                "heat_warning": day_warning,
+            }
+        )
+
+    warning_days = [day for day in days if day["heat_warning"]]
     return {
         "place": format_place(location),
         "observed_at": current.get("time", "n/a"),
@@ -170,13 +206,15 @@ def build_report_data(
         "temperature_c": temp_c,
         "humidity_pct": humidity,
         "heat_index_c": heat_index,
-        "heat_warning": heat_index > HEAT_INDEX_WARNING_C,
+        "heat_warning": current_warning,
         "forecast_days": days,
+        "any_heat_warning": current_warning or bool(warning_days),
+        "warning_days": warning_days,
     }
 
 
 def format_txt_report(report: dict[str, Any]) -> str:
-    width = 48
+    width = 62
     lines = [
         "=" * width,
         f"  Heat Risk Report — {report['place']}",
@@ -190,24 +228,38 @@ def format_txt_report(report: dict[str, Any]) -> str:
         f"    Heat index:    {report['heat_index_c']:5.1f} °C",
         "-" * width,
         "  3-day forecast",
-        f"  {'Date':<12} {'High':>10} {'Low':>10}",
-        f"  {'-' * 12} {'-' * 10} {'-' * 10}",
+        f"  {'Date':<12} {'High':>10} {'Low':>10} {'Max HI':>10} {'Warn':>6}",
+        f"  {'-' * 12} {'-' * 10} {'-' * 10} {'-' * 10} {'-' * 6}",
     ]
     for day in report["forecast_days"]:
+        max_hi = day["heat_index_max_c"]
+        max_hi_text = f"{max_hi:7.1f} °C" if max_hi is not None else f"{'n/a':>10}"
+        warn_text = "YES" if day["heat_warning"] else "no"
         lines.append(
             f"  {day['date_label']:<12} "
             f"{day['high_c']:7.1f} °C "
-            f"{day['low_c']:7.1f} °C"
+            f"{day['low_c']:7.1f} °C "
+            f"{max_hi_text} "
+            f"{warn_text:>6}"
         )
     lines.append("=" * width)
 
-    if report["heat_warning"]:
+    if report["any_heat_warning"]:
+        lines.append("")
+        if report["heat_warning"]:
+            lines.append(
+                f"  WARNING: Current heat index is {report['heat_index_c']:.1f} °C "
+                f"(above {HEAT_INDEX_WARNING_C:.0f} °C)."
+            )
+        for day in report["warning_days"]:
+            max_hi = day["heat_index_max_c"]
+            lines.append(
+                f"  WARNING: {day['date_label']} max heat index is {max_hi:.1f} °C "
+                f"(above {HEAT_INDEX_WARNING_C:.0f} °C)."
+            )
         lines.extend(
             [
-                "",
-                f"  WARNING: Heat index is {report['heat_index_c']:.1f} °C "
-                f"(above {HEAT_INDEX_WARNING_C:.0f} °C). "
-                "Limit outdoor exposure and stay hydrated.",
+                "  Limit outdoor exposure and stay hydrated.",
                 "",
             ]
         )
@@ -253,6 +305,7 @@ def format_csv_report(report: dict[str, Any]) -> str:
         ]
     )
     for day in report["forecast_days"]:
+        max_hi = day["heat_index_max_c"]
         writer.writerow(
             [
                 "forecast",
@@ -263,11 +316,11 @@ def format_csv_report(report: dict[str, Any]) -> str:
                 f"{report['longitude']:.4f}",
                 "",
                 "",
-                "",
+                f"{max_hi:.1f}" if max_hi is not None else "",
                 day["date_iso"],
                 f"{day['high_c']:.1f}",
                 f"{day['low_c']:.1f}",
-                "",
+                str(day["heat_warning"]).lower(),
             ]
         )
     return buffer.getvalue()
@@ -288,11 +341,18 @@ def format_json_report(report: dict[str, Any]) -> str:
             "heat_index_c": round(report["heat_index_c"], 1),
             "heat_warning": report["heat_warning"],
         },
+        "any_heat_warning": report["any_heat_warning"],
         "forecast_3_day": [
             {
                 "date": day["date_iso"],
                 "high_c": round(day["high_c"], 1),
                 "low_c": round(day["low_c"], 1),
+                "heat_index_max_c": (
+                    round(day["heat_index_max_c"], 1)
+                    if day["heat_index_max_c"] is not None
+                    else None
+                ),
+                "heat_warning": day["heat_warning"],
             }
             for day in report["forecast_days"]
         ],
